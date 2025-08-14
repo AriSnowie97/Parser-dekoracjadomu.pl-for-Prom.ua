@@ -1,27 +1,97 @@
-from playwright.sync_api import sync_playwright, TimeoutError
+import telebot
+import os
 import pandas as pd
 import time
+import threading
+import sys
+from uuid import uuid4
+from playwright.sync_api import sync_playwright, TimeoutError
 
-def parse_products_to_excel():
+BOT_TOKEN = "YOUR_TG_BOT_TOKEN"
+bot = telebot.TeleBot(BOT_TOKEN)
+
+user_state = {}
+
+@bot.message_handler(commands=["start"])
+def start_cmd(message):
+    user_state[message.chat.id] = None  # сброс
+    bot.send_message(message.chat.id, (
+        "👋 Привет! Я бот-парсер товаров с сайта dekoracjadomu.pl\n\n"
+        "🔧 Команды:\n"
+        "/парсить_каталоги – парсинг всех товаров из каталога\n"
+        "/парсить_карточку – парсинг одной карточки товара\n"
+        "/выключить – выключение бота (остановка процесса)\n\n"
+        "После выбора команды отправь ссылку 🔗"
+    ))
+
+@bot.message_handler(commands=["парсить_каталоги"])
+def parse_catalog_cmd(message):
+    user_state[message.chat.id] = "catalog"
+    bot.send_message(message.chat.id, "📥 Жду ссылку на каталог товаров.")
+
+@bot.message_handler(commands=["парсить_карточку"])
+def parse_product_cmd(message):
+    user_state[message.chat.id] = "product"
+    bot.send_message(message.chat.id, "📥 Жду ссылку на карточку товара.")
+
+@bot.message_handler(commands=["выключить"])
+def shutdown_cmd(message):
+    bot.send_message(message.chat.id, "🛑 Бот выключается...")
+    user_state[message.chat.id] = None
+
+    def shutdown():
+        time.sleep(1)
+        print("❌ Бот выключен")
+        os._exit(0)  # жёсткое завершение процесса
+
+    threading.Thread(target=shutdown).start()
+
+@bot.message_handler(func=lambda m: True)
+def handle_link(message):
+    text = message.text.strip()
+    state = user_state.get(message.chat.id)
+
+    if text.startswith("http"):
+        if state == "catalog":
+            bot.send_message(message.chat.id, "⏳ Парсю каталог...")
+            try:
+                file_path = parse_catalog_to_excel(text)
+                send_excel_or_path(bot, message, file_path)
+            except Exception as e:
+                bot.send_message(message.chat.id, f"❌ Ошибка при парсинге каталога: {e}")
+            user_state[message.chat.id] = None  # сброс
+
+        elif state == "product":
+            bot.send_message(message.chat.id, "⏳ Парсю карточку товара...")
+            try:
+                file_path = parse_single_product_to_excel(text)
+                send_excel_or_path(bot, message, file_path)
+            except Exception as e:
+                bot.send_message(message.chat.id, f"❌ Ошибка при парсинге товара: {e}")
+            user_state[message.chat.id] = None  # сброс
+
+        else:
+            bot.send_message(message.chat.id, "❗ Сначала выбери команду:\n/парсить_каталоги или /парсить_карточку")
+    else:
+        bot.send_message(message.chat.id, "⚠️ Это не ссылка. Пожалуйста, отправь корректную ссылку, начиная с http.")
+
+def send_excel_or_path(bot, message, filepath):
+    try:
+        with open(filepath, 'rb') as f:
+            bot.send_document(message.chat.id, f)
+        os.remove(filepath)
+    except:
+        bot.send_message(message.chat.id, f"✅ Файл сохранён локально: {filepath}")
+
+def parse_catalog_to_excel(url: str) -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        time.sleep(5)
 
-        print("⏳ Загружаем страницу...")
-        page.goto("https://dekoracjadomu.pl/marka/atmosphera?page=2", wait_until="networkidle", timeout=60000)
-
-        time.sleep(5)  # Дополнительная пауза на загрузку JS
-
-        try:
-            page.wait_for_selector("article.product-miniature.js-product-miniature", timeout=30000)
-        except TimeoutError:
-            print("❌ Не удалось загрузить товары.")
-            browser.close()
-            return
-
+        page.wait_for_selector("article.product-miniature.js-product-miniature", timeout=30000)
         products = page.query_selector_all("article.product-miniature.js-product-miniature")
-        print(f"Найдено товаров: {len(products)}")
 
         data = []
         for product in products:
@@ -44,17 +114,55 @@ def parse_products_to_excel():
                     "Цена": price,
                     "Фото": img_url
                 })
-            except Exception as e:
-                print(f"Ошибка при обработке товара: {e}")
+            except:
+                continue
 
         browser.close()
+        filename = f"catalog_{uuid4().hex}.xlsx"
+        pd.DataFrame(data).to_excel(filename, index=False)
+        return filename
 
-        if data:
-            df = pd.DataFrame(data)
-            df.to_excel("products_with_images.xlsx", index=False)
-            print("✅ Данные с фото сохранены в файл products_with_images.xlsx")
-        else:
-            print("⚠️ Нет данных для сохранения.")
+def parse_single_product_to_excel(url: str) -> str:
+    from uuid import uuid4
+    import pandas as pd
+    import time
+    from playwright.sync_api import sync_playwright
 
-if __name__ == "__main__":
-    parse_products_to_excel()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        time.sleep(5)
+
+        def safe_text(sel):
+            el = page.query_selector(sel)
+            return el.inner_text().strip() if el else "—"
+
+        name = safe_text("h1")  # Заголовок скорее всего в h1
+        sku = safe_text("text=Numer katalogowy ~ span")  # Точный путь может отличаться
+        price = safe_text("text= zł")  # можно уточнить через unique selector
+        description = safe_text("section:has-text(\"Opis\")")
+        specs = safe_text("section:has-text(\"Specyfikacja\")")
+        
+        images = page.query_selector_all("img")
+        image_urls = [img.get_attribute("src") or img.get_attribute("data-src") for img in images][:3]
+
+        data = {
+            "Название": name,
+            "Артикул": sku,
+            "Цена": price,
+            "Описание": description,
+            "Спецификация": specs,
+            "Фото 1": image_urls[0] if len(image_urls) > 0 else "",
+            "Фото 2": image_urls[1] if len(image_urls) > 1 else "",
+            "Фото 3": image_urls[2] if len(image_urls) > 2 else "",
+            "Ссылка": url
+        }
+        df = pd.DataFrame([data])
+        filename = f"product_{uuid4().hex}.xlsx"
+        df.to_excel(filename, index=False)
+        browser.close()
+        return filename
+
+print("✅ Бот запущен")
+bot.polling(none_stop=True)
