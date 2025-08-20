@@ -7,7 +7,7 @@ import sys
 from uuid import uuid4
 from playwright.sync_api import sync_playwright, TimeoutError
 
-BOT_TOKEN = "7726560527:AAFGhWwijX6nQk24Fs5uN44GgkFXpHtsbYU"
+BOT_TOKEN = "BOT_TOKEN"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 user_state = {}
